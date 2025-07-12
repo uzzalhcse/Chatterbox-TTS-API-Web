@@ -7,7 +7,7 @@ import spaces
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Literal
 import io
 import wave
 import tempfile
@@ -22,8 +22,21 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 
+# Audio format conversion imports
+try:
+    from pydub import AudioSegment
+
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
+    print("⚠️  pydub not available. Only WAV format will be supported.")
+    print("   Install with: pip install pydub")
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"🚀 Running on device: {DEVICE}")
+
+# Supported audio formats
+SUPPORTED_FORMATS = ["wav", "mp3"] if PYDUB_AVAILABLE else ["wav"]
 
 # Voice reference constants
 VOICE_REFS_DIR = Path("voice_references")
@@ -161,6 +174,49 @@ def delete_voice_reference(voice_id: str) -> bool:
     return False
 
 
+def numpy_to_wav_bytes(audio_data: np.ndarray, sample_rate: int) -> bytes:
+    """Convert numpy array to WAV bytes."""
+    # Ensure audio is in the right format
+    if audio_data.dtype != np.int16:
+        # Convert float to int16
+        audio_data = (audio_data * 32767).astype(np.int16)
+
+    # Create WAV file in memory
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, 'wb') as wav_file:
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_data.tobytes())
+
+    return wav_buffer.getvalue()
+
+
+def convert_audio_format(audio_data: np.ndarray, sample_rate: int, output_format: str) -> tuple[bytes, str]:
+    """Convert audio data to specified format."""
+    if output_format not in SUPPORTED_FORMATS:
+        raise ValueError(f"Unsupported format: {output_format}. Supported formats: {SUPPORTED_FORMATS}")
+
+    # Always start with WAV
+    wav_bytes = numpy_to_wav_bytes(audio_data, sample_rate)
+
+    if output_format == "wav":
+        return wav_bytes, "audio/wav"
+
+    elif output_format == "mp3":
+        if not PYDUB_AVAILABLE:
+            raise ValueError("MP3 format requires pydub. Install with: pip install pydub")
+
+        # Convert WAV to MP3 using pydub
+        wav_audio = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+        mp3_buffer = io.BytesIO()
+        wav_audio.export(mp3_buffer, format="mp3", bitrate="128k")
+        return mp3_buffer.getvalue(), "audio/mpeg"
+
+    else:
+        raise ValueError(f"Unsupported format: {output_format}")
+
+
 @spaces.GPU
 def generate_tts_audio(
         text_input: str,
@@ -219,6 +275,7 @@ def generate_tts_audio(
 # --- REST API Models ---
 class TTSRequest(BaseModel):
     text: str = Field(..., max_length=300, description="Text to synthesize into speech")
+    response_format: Literal["wav", "mp3"] = Field("wav", description="Audio output format")
     exaggeration: float = Field(0.5, ge=0.25, le=2.0, description="Speech expressiveness")
     temperature: float = Field(0.8, ge=0.05, le=5.0, description="Generation randomness")
     seed: int = Field(0, ge=0, description="Random seed (0 for random)")
@@ -242,6 +299,7 @@ class VoiceReferenceInfo(BaseModel):
 class TTSRequestWithVoiceID(BaseModel):
     text: str = Field(..., max_length=300, description="Text to synthesize into speech")
     voice_id: Optional[str] = Field(None, description="ID of saved voice reference")
+    response_format: Literal["wav", "mp3"] = Field("wav", description="Audio output format")
     exaggeration: float = Field(0.5, ge=0.25, le=2.0, description="Speech expressiveness")
     temperature: float = Field(0.8, ge=0.05, le=5.0, description="Generation randomness")
     seed: int = Field(0, ge=0, description="Random seed (0 for random)")
@@ -299,15 +357,17 @@ def refresh_voice_list():
 
 # --- Gradio Interface ---
 with gr.Blocks(title="ChatterboxTTS with Voice References") as demo:
-    gr.Markdown("""
+    gr.Markdown(f"""
     # Chatterbox TTS with Voice Reference Management
 
     Upload and manage voice references for consistent voice cloning across sessions.
 
+    **Supported Audio Formats:** {', '.join(SUPPORTED_FORMATS)}
+
     **New API Endpoints:**
     - `POST /upload-voice-reference` - Upload a voice reference
     - `GET /voice-references` - List all voice references
-    - `DELETE /voice-references/{voice_id}` - Delete a voice reference
+    - `DELETE /voice-references/{{voice_id}}` - Delete a voice reference
     - `POST /generate-with-voice-id` - Generate TTS using saved voice reference
     """)
 
@@ -405,28 +465,11 @@ app = FastAPI(
 )
 
 
-def numpy_to_wav_bytes(audio_data: np.ndarray, sample_rate: int) -> bytes:
-    """Convert numpy array to WAV bytes."""
-    # Ensure audio is in the right format
-    if audio_data.dtype != np.int16:
-        # Convert float to int16
-        audio_data = (audio_data * 32767).astype(np.int16)
-
-    # Create WAV file in memory
-    wav_buffer = io.BytesIO()
-    with wave.open(wav_buffer, 'wb') as wav_file:
-        wav_file.setnchannels(1)  # Mono
-        wav_file.setsampwidth(2)  # 16-bit
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(audio_data.tobytes())
-
-    return wav_buffer.getvalue()
-
-
 @app.get("/")
 async def root():
     return {
         "message": "ChatterboxTTS API is running!",
+        "supported_formats": SUPPORTED_FORMATS,
         "endpoints": ["/generate", "/generate-with-reference", "/upload-voice-reference", "/voice-references",
                       "/generate-with-voice-id", "/health", "/web", "/docs"]
     }
@@ -440,6 +483,7 @@ async def health_check():
             "status": "healthy",
             "model_loaded": model is not None,
             "device": DEVICE,
+            "supported_formats": SUPPORTED_FORMATS,
             "voice_references_count": len(list_voice_references())
         }
     except Exception as e:
@@ -452,8 +496,15 @@ async def health_check():
 
 @app.post("/generate")
 async def generate_audio(request: TTSRequest):
-    """Generate TTS audio from text."""
+    """Generate TTS audio from text with configurable output format."""
     try:
+        # Validate format is supported
+        if request.response_format not in SUPPORTED_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format: {request.response_format}. Supported formats: {SUPPORTED_FORMATS}"
+            )
+
         sample_rate, audio_data = generate_tts_audio(
             text_input=request.text,
             audio_prompt_path_input=None,
@@ -463,16 +514,17 @@ async def generate_audio(request: TTSRequest):
             cfgw_input=request.cfg_weight
         )
 
-        # Convert to WAV bytes
-        wav_bytes = numpy_to_wav_bytes(audio_data, sample_rate)
+        # Convert to requested format
+        audio_bytes, media_type = convert_audio_format(audio_data, sample_rate, request.response_format)
 
         return Response(
-            content=wav_bytes,
-            media_type="audio/wav",
+            content=audio_bytes,
+            media_type=media_type,
             headers={
-                "Content-Disposition": "attachment; filename=generated_audio.wav",
+                "Content-Disposition": f"attachment; filename=generated_audio.{request.response_format}",
                 "X-Sample-Rate": str(sample_rate),
-                "X-Audio-Length": str(len(audio_data) / sample_rate)
+                "X-Audio-Length": str(len(audio_data) / sample_rate),
+                "X-Response-Format": request.response_format
             }
         )
     except Exception as e:
@@ -483,6 +535,7 @@ async def generate_audio(request: TTSRequest):
 async def generate_audio_with_reference(
         text: str = Form(..., max_length=300),
         reference_audio: UploadFile = File(...),
+        response_format: str = Form("wav"),
         exaggeration: float = Form(0.5),
         temperature: float = Form(0.8),
         seed: int = Form(0),
@@ -490,6 +543,13 @@ async def generate_audio_with_reference(
 ):
     """Generate TTS audio with reference audio for voice cloning."""
     try:
+        # Validate format is supported
+        if response_format not in SUPPORTED_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format: {response_format}. Supported formats: {SUPPORTED_FORMATS}"
+            )
+
         # Validate parameters
         if not (0.25 <= exaggeration <= 2.0):
             raise HTTPException(status_code=400, detail="Exaggeration must be between 0.25 and 2.0")
@@ -514,16 +574,17 @@ async def generate_audio_with_reference(
                 cfgw_input=cfg_weight
             )
 
-            # Convert to WAV bytes
-            wav_bytes = numpy_to_wav_bytes(audio_data, sample_rate)
+            # Convert to requested format
+            audio_bytes, media_type = convert_audio_format(audio_data, sample_rate, response_format)
 
             return Response(
-                content=wav_bytes,
-                media_type="audio/wav",
+                content=audio_bytes,
+                media_type=media_type,
                 headers={
-                    "Content-Disposition": "attachment; filename=generated_audio_with_reference.wav",
+                    "Content-Disposition": f"attachment; filename=generated_audio_with_reference.{response_format}",
                     "X-Sample-Rate": str(sample_rate),
-                    "X-Audio-Length": str(len(audio_data) / sample_rate)
+                    "X-Audio-Length": str(len(audio_data) / sample_rate),
+                    "X-Response-Format": response_format
                 }
             )
         finally:
@@ -580,8 +641,15 @@ async def delete_voice_ref(voice_id: str):
 
 @app.post("/generate-with-voice-id")
 async def generate_audio_with_voice_id(request: TTSRequestWithVoiceID):
-    """Generate TTS audio using a saved voice reference ID."""
+    """Generate TTS audio using a saved voice reference ID with configurable output format."""
     try:
+        # Validate format is supported
+        if request.response_format not in SUPPORTED_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format: {request.response_format}. Supported formats: {SUPPORTED_FORMATS}"
+            )
+
         # Get voice reference file path if voice_id is provided
         audio_prompt_path = None
         if request.voice_id:
@@ -598,17 +666,18 @@ async def generate_audio_with_voice_id(request: TTSRequestWithVoiceID):
             cfgw_input=request.cfg_weight
         )
 
-        # Convert to WAV bytes
-        wav_bytes = numpy_to_wav_bytes(audio_data, sample_rate)
+        # Convert to requested format
+        audio_bytes, media_type = convert_audio_format(audio_data, sample_rate, request.response_format)
 
         return Response(
-            content=wav_bytes,
-            media_type="audio/wav",
+            content=audio_bytes,
+            media_type=media_type,
             headers={
-                "Content-Disposition": "attachment; filename=generated_audio.wav",
+                "Content-Disposition": f"attachment; filename=generated_audio.{request.response_format}",
                 "X-Sample-Rate": str(sample_rate),
                 "X-Audio-Length": str(len(audio_data) / sample_rate),
-                "X-Voice-ID": request.voice_id or "default"
+                "X-Voice-ID": request.voice_id or "default",
+                "X-Response-Format": request.response_format
             }
         )
     except HTTPException:
@@ -679,6 +748,7 @@ if __name__ == "__main__":
     print(f"🌐 Starting unified server on http://0.0.0.0:{args.port}")
     print(f"   🎯 Web Interface: http://0.0.0.0:{args.port}/web")
     print(f"   📚 API Documentation: http://0.0.0.0:{args.port}/docs")
+    print(f"   🎵 Supported formats: {', '.join(SUPPORTED_FORMATS)}")
 
     # Run the server
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
