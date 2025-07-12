@@ -1,6 +1,6 @@
 # Core ML and Audio Processing
 torch>=2.0.0
-numpy==1.26.0
+numpy==2.0.0
 resampy==0.4.3
 librosa==0.10.0
 s3tokenizer
