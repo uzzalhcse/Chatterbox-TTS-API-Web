@@ -7,7 +7,7 @@ import spaces
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Dict, List
 import io
 import wave
 import tempfile
@@ -15,8 +15,22 @@ import os
 import uvicorn
 from contextlib import asynccontextmanager
 
+# Voice reference management imports
+import json
+import hashlib
+import shutil
+from pathlib import Path
+from datetime import datetime
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"🚀 Running on device: {DEVICE}")
+
+# Voice reference constants
+VOICE_REFS_DIR = Path("voice_references")
+VOICE_REFS_DB = VOICE_REFS_DIR / "voice_refs.json"
+
+# Create voice references directory
+VOICE_REFS_DIR.mkdir(exist_ok=True)
 
 # --- Global Model Initialization ---
 MODEL = None
@@ -56,6 +70,97 @@ def set_seed(seed: int):
     np.random.seed(seed)
 
 
+# Voice reference management functions
+def load_voice_refs_db() -> Dict:
+    """Load the voice references database."""
+    if VOICE_REFS_DB.exists():
+        try:
+            with open(VOICE_REFS_DB, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+    return {}
+
+
+def save_voice_refs_db(db: Dict):
+    """Save the voice references database."""
+    with open(VOICE_REFS_DB, 'w') as f:
+        json.dump(db, f, indent=2)
+
+
+def generate_voice_id(name: str, file_content: bytes) -> str:
+    """Generate a unique ID for a voice reference."""
+    # Create hash from name and file content
+    content_hash = hashlib.md5(file_content).hexdigest()[:8]
+    safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+    return f"{safe_name.replace(' ', '_')}_{content_hash}"
+
+
+def save_voice_reference(name: str, file_content: bytes, original_filename: str) -> str:
+    """Save a voice reference and return its ID."""
+    voice_id = generate_voice_id(name, file_content)
+
+    # Determine file extension
+    file_ext = Path(original_filename).suffix or '.wav'
+    file_path = VOICE_REFS_DIR / f"{voice_id}{file_ext}"
+
+    # Save the file
+    with open(file_path, 'wb') as f:
+        f.write(file_content)
+
+    # Update database
+    db = load_voice_refs_db()
+    db[voice_id] = {
+        'name': name,
+        'filename': str(file_path),
+        'original_filename': original_filename,
+        'created_at': datetime.now().isoformat(),
+        'file_size': len(file_content)
+    }
+    save_voice_refs_db(db)
+
+    return voice_id
+
+
+def get_voice_reference(voice_id: str) -> Optional[str]:
+    """Get the file path for a voice reference."""
+    db = load_voice_refs_db()
+    if voice_id in db:
+        file_path = db[voice_id]['filename']
+        if Path(file_path).exists():
+            return file_path
+    return None
+
+
+def list_voice_references() -> List[Dict]:
+    """List all available voice references."""
+    db = load_voice_refs_db()
+    result = []
+    for voice_id, info in db.items():
+        if Path(info['filename']).exists():
+            result.append({
+                'id': voice_id,
+                'name': info['name'],
+                'created_at': info['created_at'],
+                'file_size': info['file_size'],
+                'original_filename': info['original_filename']
+            })
+    return result
+
+
+def delete_voice_reference(voice_id: str) -> bool:
+    """Delete a voice reference."""
+    db = load_voice_refs_db()
+    if voice_id in db:
+        file_path = Path(db[voice_id]['filename'])
+        if file_path.exists():
+            file_path.unlink()
+        del db[voice_id]
+        save_voice_refs_db(db)
+        return True
+    return False
+
+
 @spaces.GPU
 def generate_tts_audio(
         text_input: str,
@@ -68,8 +173,8 @@ def generate_tts_audio(
     """
     Generate high-quality speech audio from text using ChatterboxTTS model with optional reference audio styling.
 
-    This tool synthesizes natural-sounding speech from input text. When a reference audio file 
-    is provided, it captures the speaker's voice characteristics and speaking style. The generated audio 
+    This tool synthesizes natural-sounding speech from input text. When a reference audio file
+    is provided, it captures the speaker's voice characteristics and speaking style. The generated audio
     maintains the prosody, tone, and vocal qualities of the reference speaker, or uses default voice if no reference is provided.
 
     Args:
@@ -126,62 +231,160 @@ class TTSResponse(BaseModel):
     audio_length_seconds: float
 
 
+class VoiceReferenceInfo(BaseModel):
+    id: str
+    name: str
+    created_at: str
+    file_size: int
+    original_filename: str
+
+
+class TTSRequestWithVoiceID(BaseModel):
+    text: str = Field(..., max_length=300, description="Text to synthesize into speech")
+    voice_id: Optional[str] = Field(None, description="ID of saved voice reference")
+    exaggeration: float = Field(0.5, ge=0.25, le=2.0, description="Speech expressiveness")
+    temperature: float = Field(0.8, ge=0.05, le=5.0, description="Generation randomness")
+    seed: int = Field(0, ge=0, description="Random seed (0 for random)")
+    cfg_weight: float = Field(0.5, ge=0.2, le=1.0, description="CFG/Pace weight")
+
+
+# Gradio interface functions
+def get_voice_choices():
+    """Get voice reference choices for dropdown."""
+    voices = list_voice_references()
+    choices = [("None (Default Voice)", "")]
+    for voice in voices:
+        choices.append((f"{voice['name']} ({voice['id']})", voice['id']))
+    return choices
+
+
+def upload_voice_ref(name, audio_file):
+    """Upload a voice reference through Gradio."""
+    if not audio_file or not name:
+        return "Please provide both name and audio file", gr.update()
+
+    try:
+        with open(audio_file, 'rb') as f:
+            content = f.read()
+        voice_id = save_voice_reference(name, content, Path(audio_file).name)
+        return f"Voice reference '{name}' uploaded successfully! ID: {voice_id}", gr.update(choices=get_voice_choices())
+    except Exception as e:
+        return f"Upload failed: {str(e)}", gr.update()
+
+
+def generate_with_voice_id(text, voice_id, exaggeration, temperature, seed_num, cfg_weight):
+    """Generate audio using voice ID."""
+    audio_prompt_path = None
+    if voice_id:
+        audio_prompt_path = get_voice_reference(voice_id)
+        if not audio_prompt_path:
+            raise gr.Error(f"Voice reference not found: {voice_id}")
+
+    return generate_tts_audio(
+        text_input=text,
+        audio_prompt_path_input=audio_prompt_path,
+        exaggeration_input=exaggeration,
+        temperature_input=temperature,
+        seed_num_input=seed_num,
+        cfgw_input=cfg_weight
+    )
+
+
+def refresh_voice_list():
+    """Refresh the voice reference list."""
+    voices = list_voice_references()
+    data = [[v['id'], v['name'], v['created_at'], f"{v['file_size']} bytes"] for v in voices]
+    return gr.update(value=data), gr.update(choices=get_voice_choices())
+
+
 # --- Gradio Interface ---
-with gr.Blocks(title="ChatterboxTTS") as demo:
-    gr.Markdown(
-        """
-        # Chatterbox TTS Demo
-        Generate high-quality speech from text with reference audio styling.
+with gr.Blocks(title="ChatterboxTTS with Voice References") as demo:
+    gr.Markdown("""
+    # Chatterbox TTS with Voice Reference Management
 
-        **API Endpoints:**
-        - `GET /` - API info
-        - `GET /health` - Health check
-        - `POST /generate` - Generate TTS from text only
-        - `POST /generate-with-reference` - Generate TTS with reference audio
-        - `GET /web` - This Gradio interface
-        """
+    Upload and manage voice references for consistent voice cloning across sessions.
+
+    **New API Endpoints:**
+    - `POST /upload-voice-reference` - Upload a voice reference
+    - `GET /voice-references` - List all voice references
+    - `DELETE /voice-references/{voice_id}` - Delete a voice reference
+    - `POST /generate-with-voice-id` - Generate TTS using saved voice reference
+    """)
+
+    with gr.Tab("Generate Speech"):
+        with gr.Row():
+            with gr.Column():
+                text = gr.Textbox(
+                    value="Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Now smell that. Oh boy this is going to be incredible.",
+                    label="Text to synthesize (max 300 chars)",
+                    max_lines=5
+                )
+
+                voice_dropdown = gr.Dropdown(
+                    choices=get_voice_choices(),
+                    value="",
+                    label="Select Voice Reference",
+                    interactive=True
+                )
+
+                exaggeration = gr.Slider(
+                    0.25, 2, step=0.05,
+                    label="Exaggeration (Neutral = 0.5, extreme values can be unstable)",
+                    value=0.5
+                )
+                cfg_weight = gr.Slider(
+                    0.2, 1, step=0.05,
+                    label="CFG/Pace",
+                    value=0.5
+                )
+
+                with gr.Accordion("Advanced Options", open=False):
+                    seed_num = gr.Number(value=0, label="Random seed (0 for random)")
+                    temp = gr.Slider(0.05, 5, step=0.05, label="Temperature", value=0.8)
+
+                generate_btn = gr.Button("Generate Speech", variant="primary")
+
+            with gr.Column():
+                audio_output = gr.Audio(label="Generated Audio")
+
+    with gr.Tab("Manage Voice References"):
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### Upload New Voice Reference")
+                voice_name = gr.Textbox(label="Voice Reference Name")
+                voice_file = gr.Audio(sources=["upload"], type="filepath", label="Audio File")
+                upload_btn = gr.Button("Upload Voice Reference")
+                upload_status = gr.Textbox(label="Status", interactive=False)
+
+            with gr.Column():
+                gr.Markdown("### Current Voice References")
+                refresh_btn = gr.Button("Refresh List")
+                voice_list = gr.Dataframe(
+                    headers=["ID", "Name", "Created", "File Size"],
+                    datatype=["str", "str", "str", "str"],
+                    interactive=False
+                )
+
+    # Event handlers
+    generate_btn.click(
+        fn=generate_with_voice_id,
+        inputs=[text, voice_dropdown, exaggeration, temp, seed_num, cfg_weight],
+        outputs=[audio_output]
     )
-    with gr.Row():
-        with gr.Column():
-            text = gr.Textbox(
-                value="Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Now smell that. Oh boy this is going to be incredible.",
-                label="Text to synthesize (max chars 300)",
-                max_lines=5
-            )
-            ref_wav = gr.Audio(
-                sources=["upload", "microphone"],
-                type="filepath",
-                label="Reference Audio File (Optional)",
-                value="https://storage.googleapis.com/chatterbox-demo-samples/prompts/female_shadowheart4.flac"
-            )
-            exaggeration = gr.Slider(
-                0.25, 2, step=.05, label="Exaggeration (Neutral = 0.5, extreme values can be unstable)", value=.5
-            )
-            cfg_weight = gr.Slider(
-                0.2, 1, step=.05, label="CFG/Pace", value=0.5
-            )
 
-            with gr.Accordion("More options", open=False):
-                seed_num = gr.Number(value=0, label="Random seed (0 for random)")
-                temp = gr.Slider(0.05, 5, step=.05, label="Temperature", value=.8)
-
-            run_btn = gr.Button("Generate", variant="primary")
-
-        with gr.Column():
-            audio_output = gr.Audio(label="Output Audio")
-
-    run_btn.click(
-        fn=generate_tts_audio,
-        inputs=[
-            text,
-            ref_wav,
-            exaggeration,
-            temp,
-            seed_num,
-            cfg_weight,
-        ],
-        outputs=[audio_output],
+    upload_btn.click(
+        fn=upload_voice_ref,
+        inputs=[voice_name, voice_file],
+        outputs=[upload_status, voice_dropdown]
     )
+
+    refresh_btn.click(
+        fn=refresh_voice_list,
+        outputs=[voice_list, voice_dropdown]
+    )
+
+    # Load initial voice list
+    demo.load(fn=refresh_voice_list, outputs=[voice_list, voice_dropdown])
 
 
 # --- FastAPI App ---
@@ -224,7 +427,8 @@ def numpy_to_wav_bytes(audio_data: np.ndarray, sample_rate: int) -> bytes:
 async def root():
     return {
         "message": "ChatterboxTTS API is running!",
-        "endpoints": ["/generate", "/generate-with-reference", "/health", "/web", "/docs"]
+        "endpoints": ["/generate", "/generate-with-reference", "/upload-voice-reference", "/voice-references",
+                      "/generate-with-voice-id", "/health", "/web", "/docs"]
     }
 
 
@@ -235,7 +439,8 @@ async def health_check():
         return {
             "status": "healthy",
             "model_loaded": model is not None,
-            "device": DEVICE
+            "device": DEVICE,
+            "voice_references_count": len(list_voice_references())
         }
     except Exception as e:
         return {
@@ -325,6 +530,87 @@ async def generate_audio_with_reference(
             # Clean up temporary file
             os.unlink(tmp_file_path)
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
+
+
+@app.post("/upload-voice-reference")
+async def upload_voice_reference(
+        name: str = Form(..., description="Name for the voice reference"),
+        audio_file: UploadFile = File(..., description="Audio file for voice reference")
+):
+    """Upload and save a voice reference for future use."""
+    try:
+        # Validate file type
+        if not audio_file.content_type.startswith('audio/'):
+            raise HTTPException(status_code=400, detail="File must be an audio file")
+
+        # Read file content
+        content = await audio_file.read()
+
+        # Save voice reference
+        voice_id = save_voice_reference(name, content, audio_file.filename)
+
+        return {
+            "message": "Voice reference uploaded successfully",
+            "voice_id": voice_id,
+            "name": name
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+@app.get("/voice-references", response_model=List[VoiceReferenceInfo])
+async def get_voice_references():
+    """List all available voice references."""
+    return list_voice_references()
+
+
+@app.delete("/voice-references/{voice_id}")
+async def delete_voice_ref(voice_id: str):
+    """Delete a voice reference."""
+    if delete_voice_reference(voice_id):
+        return {"message": f"Voice reference {voice_id} deleted successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="Voice reference not found")
+
+
+@app.post("/generate-with-voice-id")
+async def generate_audio_with_voice_id(request: TTSRequestWithVoiceID):
+    """Generate TTS audio using a saved voice reference ID."""
+    try:
+        # Get voice reference file path if voice_id is provided
+        audio_prompt_path = None
+        if request.voice_id:
+            audio_prompt_path = get_voice_reference(request.voice_id)
+            if not audio_prompt_path:
+                raise HTTPException(status_code=404, detail=f"Voice reference {request.voice_id} not found")
+
+        sample_rate, audio_data = generate_tts_audio(
+            text_input=request.text,
+            audio_prompt_path_input=audio_prompt_path,
+            exaggeration_input=request.exaggeration,
+            temperature_input=request.temperature,
+            seed_num_input=request.seed,
+            cfgw_input=request.cfg_weight
+        )
+
+        # Convert to WAV bytes
+        wav_bytes = numpy_to_wav_bytes(audio_data, sample_rate)
+
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": "attachment; filename=generated_audio.wav",
+                "X-Sample-Rate": str(sample_rate),
+                "X-Audio-Length": str(len(audio_data) / sample_rate),
+                "X-Voice-ID": request.voice_id or "default"
+            }
+        )
     except HTTPException:
         raise
     except Exception as e:
